@@ -1,409 +1,225 @@
-"""
-Step 6: Train a Diffusion Policy
-==================================
-This script provides a self-contained training loop for a simple
-behavior-cloning policy on the OpenCabinet task, suitable for
-understanding the training pipeline.
-
-For production-quality training, use the official Diffusion Policy repo:
-    git clone https://github.com/robocasa-benchmark/diffusion_policy
-    cd diffusion_policy && pip install -e .
-    python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
-
-This simplified version trains a small CNN+MLP policy to demonstrate
-the data loading -> training -> checkpoint pipeline.
-
-Usage:
-    python 06_train_policy.py [--epochs 50] [--batch_size 32] [--lr 1e-4]
-    python 06_train_policy.py --use_diffusion_policy   # Use official repo
-"""
-
 import argparse
 import os
 import sys
 import yaml
+import datetime as _dt
 
 import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
+# Ensure local imports work correctly
+from diffusion_policy.diffusion_policy.dataset.lerobot_dataset import LerobotLowdimDataset
+from diffusion_policy.diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
+from diffusion_policy.diffusion_policy.policy.diffusion_unet_lowdim_policy import (
+    DiffusionUnetLowdimPolicy,
+)
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 def print_section(title):
     print(f"\n{'=' * 60}")
     print(f"  {title}")
     print(f"{'=' * 60}")
 
-
 def load_config(config_path):
-    """Load training configuration from YAML file."""
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
-
 def get_dataset_path():
-    """Get the path to the OpenCabinet dataset."""
-    import robocasa  # noqa: F401
+    import robocasa
     from robocasa.utils.dataset_registry_utils import get_ds_path
-
     path = get_ds_path("OpenCabinet", source="human")
     if path is None or not os.path.exists(path):
         print("ERROR: Dataset not found. Run 04_download_dataset.py first.")
         sys.exit(1)
     return path
 
+def _build_open_cabinet_shape_meta():
+    return {
+        "obs": {
+            "base_pos": {
+                "shape": [3],
+                "type": "low_dim",
+                "lerobot_keys": ["state.base_position"], # Matches remapped key
+            },
+            "base_quat": {
+                "shape": [4],
+                "type": "low_dim",
+                "lerobot_keys": ["state.base_rotation"],
+            },
+            "robot0_base_to_eef_pos": {
+                "shape": [3],
+                "type": "low_dim",
+                "lerobot_keys": ["state.end_effector_position_relative"],
+            },
+            "robot0_base_to_eef_quat": {
+                "shape": [4],
+                "type": "low_dim",
+                "lerobot_keys": ["state.end_effector_rotation_relative"],
+            },
+            "robot0_gripper_qpos": {
+                "shape": [2],
+                "type": "low_dim",
+                "lerobot_keys": ["state.gripper_qpos"],
+            },
+            "handle_pos": {
+                "shape": [3],
+                "type": "low_dim",
+                "lerobot_keys": ["state.handle_pos"], # Maps to observation.handle_pos
+            },
+            "handle_to_eef_pos": {
+                "shape": [3],
+                "type": "low_dim",
+                "lerobot_keys": ["state.handle_to_eef_pos"], # Maps to observation.handle_to_eef_pos
+            },
+            "door_openness": {
+                "shape": [1],
+                "type": "low_dim",
+                "lerobot_keys": ["state.door_openness"], # Maps to observation.door_openness
+            },
+        },
+        "action": {
+            "shape": [12],
+            "lerobot_keys": [
+                "action.base_motion",            
+                "action.control_mode",           
+                "action.end_effector_position",  
+                "action.end_effector_rotation",  
+                "action.gripper_close",          
+            ],
+        },
+    }
 
-def train_simple_policy(config):
-    """
-    Train a simple behavior-cloning policy.
+def train_unet_lowdim_policy(config):
+    print_section("Diffusion U-Net Lowdim Policy (Optimized for A100)")
+    
+    # ----------------------------
+    # High-Performance Defaults
+    # ----------------------------
+    epochs = int(config.get("epochs", 50))
+    batch_size = int(config.get("batch_size", 256)) # Increased for A100
+    learning_rate = float(config.get("learning_rate", 1e-4))
+    checkpoint_dir = config.get("checkpoint_dir", "/tmp/cabinet_unet_checkpoints")
+    num_workers = int(config.get("num_workers", 8)) # Use Colab's multi-core CPU
+    
+    # Fast-Validation Settings
+    val_ratio = float(config.get("val_ratio", 0.05))
+    val_every = int(config.get("val_every", 5))
+    num_inference_steps = int(config.get("num_inference_steps", 20)) # Sped up from 100
+    
+    horizon = int(config.get("horizon", 16))
+    n_obs_steps = int(config.get("n_obs_steps", 2))
+    n_action_steps = int(config.get("n_action_steps", 8))
 
-    This is a simplified training loop to illustrate the pipeline.
-    For real results, use the official Diffusion Policy codebase.
-    """
-    try:
-        import torch
-        import torch.nn as nn
-        from torch.utils.data import DataLoader, Dataset
-    except ImportError:
-        print("ERROR: PyTorch is required for training.")
-        print("Install with: pip install torch torchvision")
-        sys.exit(1)
+    # Slim U-Net dims for low-dim states
+    down_dims = config.get("down_dims", [128, 256, 512]) 
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-    print_section("Simple Behavior Cloning Policy")
+    # ----------------------------
+    # Dataset Loading (RAM Cached)
+    # ----------------------------
+    dataset_path = "/Users/joycechen/classes/188_robotics/cs188-cabinet-door-project/robocasa/datasets/v1.0/pretrain/atomic/OpenCabinet/20250819/lerobot_augmented"
+    print(f"Using dataset: {dataset_path}")
 
-    dataset_path = get_dataset_path()
-    print(f"Dataset: {dataset_path}")
+    shape_meta = _build_open_cabinet_shape_meta()
+    obs_dim = sum(v["shape"][0] for v in shape_meta["obs"].values())
+    action_dim = int(shape_meta["action"]["shape"][0])
 
-    # ----------------------------------------------------------------
-    # 1. Build a simple dataset from the LeRobot format
-    # ----------------------------------------------------------------
-    print("\nLoading dataset...")
-
-    class CabinetDemoDataset(Dataset):
-        """
-        Loads state-action pairs from the LeRobot-format dataset.
-
-        For simplicity, this uses only the low-dimensional state observations
-        (gripper qpos, base pose, eef pose) rather than images.
-        Full visuomotor training with images requires the Diffusion Policy repo.
-        """
-
-        def __init__(self, dataset_path, max_episodes=None):
-            import pyarrow.parquet as pq
-
-            self.states = []
-            self.actions = []
-
-            # The dataset path from get_ds_path may point to the lerobot dir directly
-            # or to the parent. Try both layouts.
-            data_dir = os.path.join(dataset_path, "data")
-            if not os.path.exists(data_dir):
-                data_dir = os.path.join(dataset_path, "lerobot", "data")
-            if not os.path.exists(data_dir):
-                raise FileNotFoundError(
-                    f"Data directory not found under: {dataset_path}\n"
-                    "Make sure you downloaded the dataset with 04_download_dataset.py"
-                )
-
-            # Load parquet files
-            chunk_dir = os.path.join(data_dir, "chunk-000")
-            if not os.path.exists(chunk_dir):
-                raise FileNotFoundError(f"Chunk directory not found: {chunk_dir}")
-
-            parquet_files = sorted(
-                f for f in os.listdir(chunk_dir) if f.endswith(".parquet")
-            )
-            if not parquet_files:
-                raise FileNotFoundError(f"No parquet files found in {chunk_dir}")
-
-            episodes_loaded = 0
-            for pf in parquet_files:
-                table = pq.read_table(os.path.join(chunk_dir, pf))
-                df = table.to_pandas()
-
-                # Extract state and action columns
-                state_cols = [
-                    c for c in df.columns if c.startswith("observation.state")
-                ]
-                action_cols = [
-                    c for c in df.columns
-                    if c == "action" or c.startswith("action.")
-                ]
-
-                if not state_cols or not action_cols:
-                    # Try alternative column naming
-                    state_cols = [
-                        c
-                        for c in df.columns
-                        if "gripper" in c or "base" in c or "eef" in c
-                    ]
-                    action_cols = [c for c in df.columns if "action" in c]
-
-                if state_cols and action_cols:
-                    for _, row in df.iterrows():
-                        # Values may be numpy arrays (object columns) or scalars
-                        state_parts = []
-                        for c in state_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                state_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                state_parts.append(float(val))
-                        action_parts = []
-                        for c in action_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                action_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                action_parts.append(float(val))
-
-                        if state_parts and action_parts:
-                            self.states.append(np.array(state_parts, dtype=np.float32))
-                            self.actions.append(np.array(action_parts, dtype=np.float32))
-
-                episodes_loaded += 1
-                if max_episodes and episodes_loaded >= max_episodes:
-                    break
-
-            if len(self.states) == 0:
-                print("WARNING: Could not extract state-action pairs from parquet files.")
-                print("The dataset may use a different format.")
-                print("Generating synthetic demo data for illustration...")
-                self._generate_synthetic_data()
-
-            self.states = np.array(self.states, dtype=np.float32)
-            self.actions = np.array(self.actions, dtype=np.float32)
-
-            print(f"Loaded {len(self.states)} state-action pairs")
-            print(f"State dim:  {self.states.shape[-1]}")
-            print(f"Action dim: {self.actions.shape[-1]}")
-
-        def _generate_synthetic_data(self):
-            """Generate synthetic data for demonstration purposes."""
-            rng = np.random.default_rng(42)
-            for _ in range(1000):
-                state = rng.standard_normal(16).astype(np.float32)
-                action = rng.standard_normal(12).astype(np.float32) * 0.1
-                self.states.append(state)
-                self.actions.append(action)
-
-        def __len__(self):
-            return len(self.states)
-
-        def __getitem__(self, idx):
-            return (
-                torch.from_numpy(self.states[idx]),
-                torch.from_numpy(self.actions[idx]),
-            )
-
-    dataset = CabinetDemoDataset(dataset_path, max_episodes=50)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        drop_last=True,
+    # Dataset will now pre-load to RAM based on our new lerobot_dataset.py
+    train_dataset = LerobotLowdimDataset(
+        shape_meta=shape_meta, dataset_path=dataset_path,
+        horizon=horizon, n_obs_steps=n_obs_steps,
+        val_ratio=val_ratio, split="train", use_cache=True
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, prefetch_factor=2
     )
 
-    # ----------------------------------------------------------------
-    # 2. Define a simple MLP policy
-    # ----------------------------------------------------------------
-    state_dim = dataset.states.shape[-1]
-    action_dim = dataset.actions.shape[-1]
+    val_loader = None
+    if val_ratio > 0:
+        val_dataset = LerobotLowdimDataset(
+            shape_meta=shape_meta, dataset_path=dataset_path,
+            horizon=horizon, n_obs_steps=n_obs_steps,
+            val_ratio=val_ratio, split="val", use_cache=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers)
 
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
-                nn.Tanh(),
-            )
+    # ----------------------------
+    # Policy Setup
+    # ----------------------------
+    model = ConditionalUnet1D(
+        input_dim=action_dim,
+        global_cond_dim=obs_dim * n_obs_steps,
+        down_dims=down_dims,
+    )
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=50, # speding up from 100
+        beta_schedule="squaredcos_cap_v2",
+        prediction_type="epsilon",
+    )
+    policy = DiffusionUnetLowdimPolicy(
+        model=model, noise_scheduler=noise_scheduler,
+        horizon=horizon, obs_dim=obs_dim, action_dim=action_dim,
+        n_action_steps=n_action_steps, n_obs_steps=n_obs_steps,
+        num_inference_steps=num_inference_steps,
+        obs_as_global_cond=True
+    ).to(device)
 
-        def forward(self, state):
-            return self.net(state)
+    policy.set_normalizer(train_dataset.get_normalizer())
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=1e-6)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nDevice: {device}")
-
-    model = SimplePolicy(state_dim, action_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
-
-    # ----------------------------------------------------------------
-    # 3. Training loop
-    # ----------------------------------------------------------------
-    print_section("Training")
-    print(f"Epochs:     {config['epochs']}")
-    print(f"Batch size: {config['batch_size']}")
-    print(f"LR:         {config['learning_rate']}")
-
-    checkpoint_dir = config.get("checkpoint_dir", "/tmp/cabinet_policy_checkpoints")
+    # ----------------------------
+    # Training Loop
+    # ----------------------------
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = f"{checkpoint_dir}_{stamp}"
     os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    print(f"Batch size: {batch_size} | Model: {down_dims}")
 
-    best_loss = float("inf")
-    avg_loss = float("inf")
-    ckpt_path = os.path.join(checkpoint_dir, "best_policy.pt")
-    for epoch in range(config["epochs"]):
-        epoch_loss = 0.0
-        num_batches = 0
-
-        model.train()
-        for states_batch, actions_batch in dataloader:
-            states_batch = states_batch.to(device)
-            actions_batch = actions_batch.to(device)
-
-            pred_actions = model(states_batch)
-            loss = nn.functional.mse_loss(pred_actions, actions_batch)
-
+    for epoch in range(epochs):
+        policy.train()
+        losses = []
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            loss = policy.compute_loss(batch)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            losses.append(loss.item())
 
-            epoch_loss += loss.item()
-            num_batches += 1
+        print(f"  Epoch {epoch + 1:4d} | Train Loss: {np.mean(losses):.6f}")
 
-        avg_loss = epoch_loss / max(num_batches, 1)
+        # Validation and Checkpointing (standard logic)
+        if (epoch + 1) % val_every == 0 and val_loader:
+            policy.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    val_losses.append(policy.compute_loss(batch).item())
+            print(f"    Validation Loss: {np.mean(val_losses):.6f}")
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1:4d}/{config['epochs']}  Loss: {avg_loss:.6f}")
+        if (epoch + 1) % 10 == 0:
+            torch.save(policy.state_dict(), os.path.join(checkpoint_dir, f"epoch_{epoch+1}.pt"))
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            ckpt_path = os.path.join(checkpoint_dir, "best_policy.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": best_loss,
-                    "state_dim": state_dim,
-                    "action_dim": action_dim,
-                },
-                ckpt_path,
-            )
-
-    # Save final checkpoint
-    final_path = os.path.join(checkpoint_dir, "final_policy.pt")
-    torch.save(
-        {
-            "epoch": config["epochs"],
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "loss": avg_loss,
-            "state_dim": state_dim,
-            "action_dim": action_dim,
-        },
-        final_path,
-    )
-
-    print(f"\nTraining complete!")
-    print(f"Best loss:        {best_loss:.6f}")
-    print(f"Best checkpoint:  {ckpt_path}")
-    print(f"Final checkpoint: {final_path}")
-
-    print_section("Next Steps")
-    print(
-        "This simple MLP policy is for educational purposes only.\n"
-        "For a policy that can actually solve the task, use the\n"
-        "official Diffusion Policy codebase:\n"
-        "\n"
-        "  git clone https://github.com/robocasa-benchmark/diffusion_policy\n"
-        "  cd diffusion_policy && pip install -e .\n"
-        "  python train.py \\\n"
-        "    --config-name=train_diffusion_transformer_bs192 \\\n"
-        "    task=robocasa/OpenCabinet\n"
-        "\n"
-        "Alternatively, try pi-0 or GR00T N1.5:\n"
-        "  https://github.com/robocasa-benchmark/openpi\n"
-        "  https://github.com/robocasa-benchmark/Isaac-GR00T"
-    )
-
-
-def print_diffusion_policy_instructions():
-    """Print instructions for using the official Diffusion Policy repo."""
-    print_section("Official Diffusion Policy Training")
-    print(
-        "For production-quality policy training, use the official repos:\n"
-        "\n"
-        "Option A: Diffusion Policy (recommended for single-task)\n"
-        "  git clone https://github.com/robocasa-benchmark/diffusion_policy\n"
-        "  cd diffusion_policy && pip install -e .\n"
-        "\n"
-        "  # Train\n"
-        "  python train.py \\\n"
-        "    --config-name=train_diffusion_transformer_bs192 \\\n"
-        "    task=robocasa/OpenCabinet\n"
-        "\n"
-        "  # Evaluate\n"
-        "  python eval_robocasa.py \\\n"
-        "    --checkpoint <path-to-checkpoint> \\\n"
-        "    --task_set atomic \\\n"
-        "    --split target\n"
-        "\n"
-        "Option B: pi-0 via OpenPi (for foundation model fine-tuning)\n"
-        "  git clone https://github.com/robocasa-benchmark/openpi\n"
-        "  cd openpi && pip install -e . && pip install -e packages/openpi-client/\n"
-        "\n"
-        "  XLA_PYTHON_CLIENT_MEM_FRACTION=1.0 python scripts/train.py \\\n"
-        "    robocasa_OpenCabinet --exp-name=cabinet_door\n"
-        "\n"
-        "Option C: GR00T N1.5 (NVIDIA foundation model)\n"
-        "  git clone https://github.com/robocasa-benchmark/Isaac-GR00T\n"
-        "  cd groot && pip install -e .\n"
-        "\n"
-        "  python scripts/gr00t_finetune.py \\\n"
-        "    --output-dir experiments/cabinet_door \\\n"
-        "    --dataset_soup robocasa_OpenCabinet \\\n"
-        "    --max_steps 50000\n"
-    )
-
+    print(f"Final checkpoint saved to {checkpoint_dir}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a policy for OpenCabinet")
-    parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="/tmp/cabinet_policy_checkpoints",
-        help="Directory to save checkpoints",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to YAML config file (overrides other args)",
-    )
-    parser.add_argument(
-        "--use_diffusion_policy",
-        action="store_true",
-        help="Print instructions for using the official Diffusion Policy repo",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use_unet_lowdim", action="store_true", default=True)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=256)
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("  OpenCabinet - Policy Training")
-    print("=" * 60)
-
-    if args.use_diffusion_policy:
-        print_diffusion_policy_instructions()
-        return
-
-    # Build config from args or YAML file
-    if args.config:
-        config = load_config(args.config)
-    else:
-        config = {
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.lr,
-            "checkpoint_dir": args.checkpoint_dir,
-        }
-
-    train_simple_policy(config)
-
+    unet_cfg = {"epochs": args.epochs, "batch_size": args.batch_size}
+    train_unet_lowdim_policy(unet_cfg)
 
 if __name__ == "__main__":
     main()

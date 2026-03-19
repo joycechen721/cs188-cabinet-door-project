@@ -18,3 +18,7 @@ MUJOCO_LOG.TXT
 
 # Lock files
 uv.lock
+
+cabinet_door_project/eval_videos
+cabinet_door_project/wandb
+cabinet_door_project/data

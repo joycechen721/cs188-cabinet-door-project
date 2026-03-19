@@ -1,34 +1,20 @@
 """
-Step 7: Evaluate a Trained Policy
-===================================
-Runs a trained policy in the OpenCabinet environment and reports
-success rate across multiple episodes and kitchen scenes.
+Evaluation script tuned for lowdim checkpoints trained by 06_train_policy.py.
 
-Usage:
-    # Evaluate the simple BC policy from Step 6
-    python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt
-
-    # Evaluate with more episodes
-    python 07_evaluate_policy.py --checkpoint path/to/policy.pt --num_rollouts 50
-
-    # Evaluate on target (held-out) kitchen scenes
-    python 07_evaluate_policy.py --checkpoint path/to/policy.pt --split target
-
-    # Save evaluation videos
-    python 07_evaluate_policy.py --checkpoint path/to/policy.pt --video_path /tmp/eval_videos.mp4
-
-For evaluating official Diffusion Policy / pi-0 / GR00T checkpoints,
-use the evaluation scripts from those repos instead (see 06_train_policy.py).
-This script also supports the local U-Net lowdim checkpoints from 06_train_policy.py.
+Includes:
+- Correct obs key mapping + computed handle features (handle_pos, handle_to_eef_pos, door_openness)
+- Correct action remap from training layout -> env layout
+- Per-dimension action clipping to controller limits (default on)
+- Optional clamp to reduce saturation
+- Optional base-to-handle assist (default on)
+- Video recording (agentview or first-person)
 """
 
 import argparse
 import os
 import sys
-import time
 
-# Force osmesa (CPU offscreen renderer) on Linux/WSL2 -- EGL requires
-# /dev/dri device access that is unavailable in WSL environments.
+# Force osmesa (CPU offscreen renderer) on Linux/WSL2
 if sys.platform == "linux":
     os.environ.setdefault("MUJOCO_GL", "osmesa")
     os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
@@ -38,11 +24,15 @@ import numpy as np
 import robocasa  # noqa: F401
 from robocasa.utils.env_utils import create_env
 
+
+def print_section(title):
+    print(f"\n{'=' * 60}")
+    print(f"  {title}")
+    print(f"{'=' * 60}")
+
+
 def get_mj_model_data(env):
-    """
-    Robustly retrieve the MuJoCo model and data objects from a robosuite env.
-    Mirrors logic from 07b_evaluate_policy_offical.py for compatibility.
-    """
+    """Robustly retrieve MuJoCo model/data across robosuite versions."""
     candidates = [env]
     for attr in ("env", "_env", "unwrapped"):
         if hasattr(env, attr):
@@ -158,119 +148,32 @@ def compute_handle_features(env, handle_ctx, open_threshold=0.90):
         "door_openness": np.array([openness], dtype=np.float32),
     }
 
-def print_section(title):
-    print(f"\n{'=' * 60}")
-    print(f"  {title}")
-    print(f"{'=' * 60}")
+
+def check_any_door_open(env, threshold=0.90, handle_ctx=None):
+    """Return True if any door joint is open past threshold."""
+    if handle_ctx is not None:
+        model, data = get_mj_model_data(env)
+        for joints in handle_ctx["handle_to_joint_map"].values():
+            if compute_door_openness(model, data, joints) >= threshold:
+                return True
+        return False
+
+    fxtr = getattr(env, "fxtr", None)
+    if fxtr is None or not hasattr(fxtr, "get_joint_state"):
+        return env._check_success()
+
+    joint_names = getattr(fxtr, "door_joint_names", None)
+    if not joint_names:
+        return env._check_success()
+
+    try:
+        joint_state = fxtr.get_joint_state(env, joint_names)
+    except Exception:
+        return env._check_success()
+
+    return any(val >= threshold for val in joint_state.values())
 
 
-def load_unet_lowdim_policy(checkpoint_path, device):
-    """Load a local U-Net lowdim policy checkpoint from 06_train_policy.py."""
-    import torch
-    from diffusion_policy.diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
-    from diffusion_policy.diffusion_policy.policy.diffusion_unet_lowdim_policy import (
-        DiffusionUnetLowdimPolicy,
-    )
-    from diffusion_policy.diffusion_policy.model.common.normalizer import LinearNormalizer
-    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    shape_meta = checkpoint.get("shape_meta", {})
-    cfg = checkpoint.get("config", {})
-    model_cfg = checkpoint.get("model_config", {})
-
-    horizon = int(cfg.get("horizon", 16))
-    n_obs_steps = int(cfg.get("n_obs_steps", 2))
-    n_action_steps = int(cfg.get("n_action_steps", 8))
-    obs_dim = int(cfg.get("obs_dim", 23))
-    action_dim = int(cfg.get("action_dim", 12))
-
-    print("Policy action dim:", action_dim)
-
-    diffusion_step_embed_dim = int(model_cfg.get("diffusion_step_embed_dim", 64))
-    down_dims = model_cfg.get("down_dims", [64, 128, 256])
-    kernel_size = int(model_cfg.get("kernel_size", 3))
-    n_groups = int(model_cfg.get("n_groups", 4))
-    num_train_timesteps = int(model_cfg.get("num_train_timesteps", 25))
-    num_inference_steps = int(model_cfg.get("num_inference_steps", 25))
-    obs_as_global_cond = bool(model_cfg.get("obs_as_global_cond", True))
-    pred_action_steps_only = bool(model_cfg.get("pred_action_steps_only", False))
-
-    model = ConditionalUnet1D(
-        input_dim=action_dim,
-        global_cond_dim=obs_dim * n_obs_steps,
-        diffusion_step_embed_dim=diffusion_step_embed_dim,
-        down_dims=down_dims,
-        kernel_size=kernel_size,
-        n_groups=n_groups,
-    )
-    noise_scheduler = DDIMScheduler(
-        num_train_timesteps=num_train_timesteps,
-        beta_schedule="squaredcos_cap_v2",
-        clip_sample=True,
-        prediction_type="epsilon",
-    )
-    policy = DiffusionUnetLowdimPolicy(
-        model=model,
-        noise_scheduler=noise_scheduler,
-        horizon=horizon,
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        n_action_steps=n_action_steps,
-        n_obs_steps=n_obs_steps,
-        num_inference_steps=num_inference_steps,
-        obs_as_global_cond=obs_as_global_cond,
-        pred_action_steps_only=pred_action_steps_only,
-    ).to(device)
-
-    policy.load_state_dict(checkpoint["model_state_dict"], strict=True)
-
-    normalizer = None
-    if "normalizer_state_dict" in checkpoint:
-        normalizer = LinearNormalizer()
-        normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
-        policy.set_normalizer(normalizer)
-
-    policy.eval()
-    print(f"Loaded U-Net lowdim policy from: {checkpoint_path}")
-    print(f"  obs_dim: {obs_dim}, action_dim: {action_dim}")
-    print(f"  horizon: {horizon}, n_obs_steps: {n_obs_steps}, n_action_steps: {n_action_steps}")
-
-    return policy, shape_meta
-
-
-def extract_state(obs, state_dim):
-    """Extract a fixed-size state vector from observations."""
-    state_parts = []
-
-    # Gather available state observations in a consistent order
-    state_keys = sorted(
-        k
-        for k in obs.keys()
-        if not k.endswith("_image") and isinstance(obs[k], np.ndarray)
-    )
-
-    for key in state_keys:
-        val = obs[key].flatten()
-        state_parts.append(val)
-
-    if not state_parts:
-        return np.zeros(state_dim, dtype=np.float32)
-
-    state = np.concatenate(state_parts).astype(np.float32)
-
-    # Pad or truncate to match expected state_dim
-    if len(state) < state_dim:
-        state = np.pad(state, (0, state_dim - len(state)))
-    elif len(state) > state_dim:
-        state = state[:state_dim]
-
-    return state
-
-
-# FIX: door_openness was commented out — the policy trained with this feature
-# so feeding zeros at eval time silently corrupts the obs vector. Uncomment and
-# verify the actual env key name by printing obs.keys() after env.reset().
 KEY_MAPPING = {
     "base_pos": "robot0_base_pos",
     "base_quat": "robot0_base_quat",
@@ -279,7 +182,7 @@ KEY_MAPPING = {
     "robot0_gripper_qpos": "robot0_gripper_qpos",
     "handle_pos": "door_obj_pos",
     "handle_to_eef_pos": "door_obj_to_robot0_eef_pos",
-    "door_openness": "door_openness",  # FIX: was commented out; confirm env key name
+    "door_openness": "door_openness",
 }
 
 
@@ -315,80 +218,120 @@ def extract_single_obs_vec(obs_raw, training_keys, obs_meta=None, debug=False):
     return np.concatenate(parts, axis=0)
 
 
-def check_any_door_open(env, threshold=0.90, handle_ctx=None):
-    """Return True if any door joint is open past threshold."""
-    if handle_ctx is not None:
-        model, data = get_mj_model_data(env)
-        for joints in handle_ctx["handle_to_joint_map"].values():
-            if compute_door_openness(model, data, joints) >= threshold:
-                return True
-        return False
-
-    fxtr = getattr(env, "fxtr", None)
-    if fxtr is None or not hasattr(fxtr, "get_joint_state"):
-        return env._check_success()
-
-    joint_names = getattr(fxtr, "door_joint_names", None)
-    if not joint_names:
-        return env._check_success()
-
-    try:
-        joint_state = fxtr.get_joint_state(env, joint_names)
-    except Exception:
-        return env._check_success()
-
-    return any(val >= threshold for val in joint_state.values())
-
-
 def remap_action(raw):
     """
-    Remap policy action (12-dim) to env action (12-dim).
+    Training action layout:
+      raw[0:4]   base_motion (x, y, yaw, torso)
+      raw[4]     control_mode
+      raw[5:11]  eef_pos + eef_rot
+      raw[11]    gripper
 
-    Policy action layout (from shape_meta):
-        raw[0:4]   base_motion
-        raw[4:5]   control_mode
-        raw[5:8]   end_effector_position
-        raw[8:11]  end_effector_rotation
-        raw[11:12] gripper_close
-
-    Env action layout (per 01_explore_environment.py):
-        env[0:6]   arm (eef_pos + eef_rot, 6 DoF)
-        env[6]     gripper
-        env[7:10]  base (x, y, yaw)
-        env[10]    torso lift
-        env[11]    control mode toggle
-
-    FIX: original code used raw[2:8] for the arm, which incorrectly included
-    base_motion[2:4] and control_mode instead of eef_pos+eef_rot (raw[5:11]).
+    Env layout:
+      env[0:6]   arm (eef_pos + eef_rot)
+      env[6]     gripper
+      env[7:10]  base (x, y, yaw)
+      env[10]    torso
+      env[11]    control_mode
     """
     action_env = np.zeros(12, dtype=np.float32)
-    action_env[0:6]  = raw[5:11]   # eef_pos + eef_rot
-    action_env[6]    = raw[11]     # gripper
-    action_env[7:10] = raw[0:3]    # base_motion x,y,yaw → base
-    action_env[10]   = raw[3]      # base_motion[3] → torso lift
-    action_env[11]   = raw[4]      # control_mode → control mode toggle
+    action_env[0:6] = raw[5:11]
+    action_env[6] = raw[11]
+    action_env[7:10] = raw[0:3]
+    action_env[10] = raw[3]
+    action_env[11] = raw[4]
     return action_env
 
 
-def run_evaluation_unet(
+def load_unet_lowdim_policy(checkpoint_path, device):
+    """Load a local U-Net lowdim policy checkpoint from 06_train_policy.py."""
+    import torch
+    from diffusion_policy.diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
+    from diffusion_policy.diffusion_policy.policy.diffusion_unet_lowdim_policy import (
+        DiffusionUnetLowdimPolicy,
+    )
+    from diffusion_policy.diffusion_policy.model.common.normalizer import LinearNormalizer
+    from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    shape_meta = checkpoint.get("shape_meta", {})
+    cfg = checkpoint.get("config", {})
+    model_cfg = checkpoint.get("model_config", {})
+
+    horizon = int(cfg.get("horizon", 16))
+    n_obs_steps = int(cfg.get("n_obs_steps", 2))
+    n_action_steps = int(cfg.get("n_action_steps", 8))
+    obs_dim = int(cfg.get("obs_dim", 23))
+    action_dim = int(cfg.get("action_dim", 12))
+
+    diffusion_step_embed_dim = int(model_cfg.get("diffusion_step_embed_dim", 64))
+    down_dims = model_cfg.get("down_dims", [64, 128, 256])
+    kernel_size = int(model_cfg.get("kernel_size", 3))
+    n_groups = int(model_cfg.get("n_groups", 4))
+    num_train_timesteps = int(model_cfg.get("num_train_timesteps", 25))
+    num_inference_steps = int(model_cfg.get("num_inference_steps", 25))
+    obs_as_global_cond = bool(model_cfg.get("obs_as_global_cond", True))
+    pred_action_steps_only = bool(model_cfg.get("pred_action_steps_only", False))
+
+    model = ConditionalUnet1D(
+        input_dim=action_dim,
+        global_cond_dim=obs_dim * n_obs_steps,
+        diffusion_step_embed_dim=diffusion_step_embed_dim,
+        down_dims=down_dims,
+        kernel_size=kernel_size,
+        n_groups=n_groups,
+    )
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_train_timesteps,
+        beta_schedule="squaredcos_cap_v2",
+        clip_sample=True,
+        prediction_type="epsilon",
+    )
+    policy = DiffusionUnetLowdimPolicy(
+        model=model,
+        noise_scheduler=noise_scheduler,
+        horizon=horizon,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        n_action_steps=n_action_steps,
+        n_obs_steps=n_obs_steps,
+        num_inference_steps=num_inference_steps,
+        obs_as_global_cond=obs_as_global_cond,
+        pred_action_steps_only=pred_action_steps_only,
+    ).to(device)
+
+    policy.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+    if "normalizer_state_dict" in checkpoint:
+        normalizer = LinearNormalizer()
+        normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
+        policy.set_normalizer(normalizer)
+
+    policy.eval()
+    print(f"Loaded U-Net lowdim policy from: {checkpoint_path}")
+    print(f"  obs_dim: {obs_dim}, action_dim: {action_dim}")
+    print(f"  horizon: {horizon}, n_obs_steps: {n_obs_steps}, n_action_steps: {n_action_steps}")
+    return policy, shape_meta
+
+
+def run_evaluation(
     policy,
     shape_meta,
     num_rollouts,
     max_steps,
     split,
-    video_path,
-    video_width,
-    video_height,
-    video_first_person,
     seed,
-    debug=False,
+    video_path=None,
+    video_width=256,
+    video_height=256,
+    video_fps=20,
+    video_first_person=False,
     clamp_action=None,
-    clip_action_limits=False,
-    zero_base_motion=False,
-    fixed_control_mode=None,
-    force_n_action_steps=None,
+    clip_action_limits=True,
+    assist_base_to_handle=True,
+    assist_base_gain=0.2,
+    assist_distance_threshold=0.15,
+    debug=False,
 ):
-    """Run evaluation for local U-Net lowdim policy."""
     import torch
     import imageio
     from collections import deque
@@ -396,8 +339,6 @@ def run_evaluation_unet(
     device = next(policy.parameters()).device
     n_obs_steps = int(getattr(policy, "n_obs_steps", 2))
     n_action_steps = int(getattr(policy, "n_action_steps", 8))
-    if force_n_action_steps is not None:
-        n_action_steps = int(force_n_action_steps)
 
     obs_meta = shape_meta.get("obs", {})
     training_keys = list(obs_meta.keys()) if obs_meta else []
@@ -412,20 +353,11 @@ def run_evaluation_unet(
         camera_heights=video_height,
     )
 
-    # Print env/controller info and validate obs mapping before episode loop
     obs = env.reset()
-    print("Env action dim:", env.action_dim)
     controller = env.robots[0].composite_controller
-    for part_name, part_controller in controller.part_controllers.items():
-        print(f"  {part_name}: action_dim={part_controller.control_dim}")
     action_low = controller.action_limits[0].astype(np.float32)
     action_high = controller.action_limits[1].astype(np.float32)
 
-    # Print door/openness-related obs keys to help confirm KEY_MAPPING
-    door_keys = [k for k in obs.keys() if any(w in k.lower() for w in ("door", "open", "cabinet"))]
-    print(f"  Door-related obs keys: {door_keys}")
-
-    # Build handle_ctx on first reset (env.sim is populated only after reset)
     handle_ctx = None
     needs_handle_ctx = any(
         k in training_keys for k in {"handle_pos", "handle_to_eef_pos", "door_openness"}
@@ -445,38 +377,16 @@ def run_evaluation_unet(
                 "handle_bodies": handle_bodies,
                 "handle_to_joint_map": build_handle_to_joint_map(handle_bodies, door_joints),
             }
-            print(f"  handle_ctx: bodies={handle_bodies}  joints={[j[0] for j in door_joints]}")
         else:
-            print("  WARNING: No handle bodies found — handle features will be zero.")
+            print("WARNING: No handle bodies found — handle features will be zero.")
 
-    # FIX: validate obs vector shape matches what the policy was trained on
     if handle_ctx is not None:
         obs = {**obs, **compute_handle_features(env, handle_ctx)}
     test_vec = extract_single_obs_vec(obs, training_keys, obs_meta=obs_meta, debug=debug)
-    if test_vec is None:
-        print("ERROR: Could not build obs vector on first reset. Check KEY_MAPPING.")
+    if test_vec is None or test_vec.shape[0] != expected_obs_dim:
+        print("ERROR: Obs vector mismatch. Check KEY_MAPPING and handle features.")
         sys.exit(1)
-    if test_vec.shape[0] != expected_obs_dim:
-        print(
-            f"ERROR: Obs dim mismatch! Got {test_vec.shape[0]}, "
-            f"expected {expected_obs_dim}. Check KEY_MAPPING for zero-filled keys."
-        )
-        sys.exit(1)
-    print(f"  Obs vec shape OK: {test_vec.shape[0]} == {expected_obs_dim}")
-    if debug:
-        print(f"  n_obs_steps={n_obs_steps}, n_action_steps={n_action_steps}")
-        if clamp_action is not None:
-            print(f"  clamp_action={clamp_action}")
-        if clip_action_limits:
-            print("  clip_action_limits=True (per-dimension controller limits)")
-        if video_first_person and video_path:
-            print("  video_first_person=True")
-        if zero_base_motion:
-            print("  zero_base_motion=True")
-        if fixed_control_mode is not None:
-            print(f"  fixed_control_mode={fixed_control_mode}")
 
-    video_writer = None
     if video_path:
         os.makedirs(video_path, exist_ok=True)
 
@@ -510,24 +420,21 @@ def run_evaluation_unet(
         "rewards": [],
     }
 
-    disable_video = False
     for ep in range(num_rollouts):
         obs = env.reset()
-
+        frames = []
         if video_path:
-            ep_video_path = os.path.join(video_path, f"episode_{ep + 1:03d}.mp4")
-            video_writer = imageio.get_writer(ep_video_path, fps=20, format="ffmpeg")
-        ep_reward = 0.0
-        success = False
+            frame = render_frame()
+            if frame is not None:
+                frames.append(frame)
 
         obs_buffer = deque(maxlen=n_obs_steps)
         obs_aug = obs
         if handle_ctx is not None:
             try:
                 obs_aug = {**obs, **compute_handle_features(env, handle_ctx)}
-            except Exception as e:
-                if ep == 0:
-                    print(f"Warning: handle feature computation failed: {e}")
+            except Exception:
+                obs_aug = obs
         first_vec = extract_single_obs_vec(obs_aug, training_keys, obs_meta=obs_meta)
         if first_vec is None:
             results["successes"].append(False)
@@ -537,7 +444,10 @@ def run_evaluation_unet(
         for _ in range(n_obs_steps):
             obs_buffer.append(first_vec.copy())
 
+        ep_reward = 0.0
+        success = False
         global_step = 0
+
         while global_step < max_steps:
             obs_seq = np.stack(list(obs_buffer), axis=0)
             obs_tensor = torch.from_numpy(obs_seq).unsqueeze(0).to(device)
@@ -545,38 +455,37 @@ def run_evaluation_unet(
                 result = policy.predict_action({"obs": obs_tensor})
                 actions = result["action"][0].cpu().numpy()
 
-            if ep == 0 and global_step == 0:
-                print(f"  Raw action[0]: {actions[0]}")
-                print(f"  Remapped:      {remap_action(actions[0])}")
-                if debug:
-                    print(f"  Raw action stats: mean={actions.mean():+.3f} "
-                          f"abs_mean={np.abs(actions).mean():.3f} "
-                          f"max={actions.max():+.3f} min={actions.min():+.3f}")
-
             chunk_len = min(n_action_steps, len(actions), max_steps - global_step)
             for i in range(chunk_len):
                 raw = actions[i].copy()
-                if zero_base_motion:
-                    raw[0:3] = 0.0
-                if fixed_control_mode is not None:
-                    raw[4] = float(fixed_control_mode)
                 action_env = remap_action(raw)
+
+                if assist_base_to_handle and handle_ctx is not None:
+                    try:
+                        extra = compute_handle_features(env, handle_ctx)
+                        to_eef = extra["handle_to_eef_pos"]
+                        base_xy = np.array([to_eef[0], to_eef[1]], dtype=np.float32)
+                        dist = np.linalg.norm(base_xy)
+                        if dist > assist_distance_threshold:
+                            base_xy = base_xy / max(dist, 1e-6)
+                            action_env[7] += assist_base_gain * base_xy[0]
+                            action_env[8] += assist_base_gain * base_xy[1]
+                    except Exception:
+                        pass
+
                 if clamp_action is not None:
                     action_env = np.clip(action_env, -clamp_action, clamp_action)
                 if clip_action_limits:
                     action_env = np.clip(action_env, action_low, action_high)
+
                 obs, reward, done, info = env.step(action_env)
                 ep_reward += reward
                 global_step += 1
 
-                if video_writer is not None and not disable_video:
-                    try:
-                        frame = render_frame()
-                        if frame is not None:
-                            video_writer.append_data(frame)
-                    except Exception as e:
-                        print(f"  Video disabled due to render error: {e}")
-                        disable_video = True
+                if video_path:
+                    frame = render_frame()
+                    if frame is not None:
+                        frames.append(frame)
 
                 obs_aug = obs
                 if handle_ctx is not None:
@@ -604,32 +513,25 @@ def run_evaluation_unet(
         status = "SUCCESS" if success else "FAIL"
         print(
             f"  Episode {ep + 1:3d}/{num_rollouts}: {status:7s} "
-            f"(steps={global_step:4d}, reward={ep_reward:.1f})"
+            f"(steps={global_step:4d}, reward={ep_reward:.2f})"
         )
-        if video_writer is not None:
-            video_writer.close()
-            video_writer = None
 
-    if video_writer:
-        video_writer.close()
+        if video_path and frames:
+            out_path = os.path.join(video_path, f"episode_{ep + 1:03d}.mp4")
+            try:
+                imageio.mimsave(out_path, frames, fps=video_fps)
+            except Exception as e:
+                print(f"  Warning: failed to save video {out_path} ({e})")
+
     env.close()
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate a trained OpenCabinet policy")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to policy checkpoint (.pt file)",
-    )
-    parser.add_argument(
-        "--num_rollouts", type=int, default=20, help="Number of evaluation episodes"
-    )
-    parser.add_argument(
-        "--max_steps", type=int, default=500, help="Max steps per episode"
-    )
+    parser = argparse.ArgumentParser(description="Max-success evaluation for OpenCabinet")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pt checkpoint")
+    parser.add_argument("--num_rollouts", type=int, default=20, help="Number of evaluation episodes")
+    parser.add_argument("--max_steps", type=int, default=600, help="Max steps per episode")
     parser.add_argument(
         "--split",
         type=str,
@@ -637,63 +539,45 @@ def main():
         choices=["pretrain", "target"],
         help="Kitchen scene split to evaluate on",
     )
-    parser.add_argument(
-        "--video_path",
-        type=str,
-        default=None,
-        help="Directory to save per-episode videos (optional)",
-    )
-    parser.add_argument(
-        "--video_width",
-        type=int,
-        default=256,
-        help="Video width (smaller is faster)",
-    )
-    parser.add_argument(
-        "--video_height",
-        type=int,
-        default=256,
-        help="Video height (smaller is faster)",
-    )
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--video_path", type=str, default=None, help="Directory to save videos")
+    parser.add_argument("--video_width", type=int, default=256, help="Video width")
+    parser.add_argument("--video_height", type=int, default=256, help="Video height")
+    parser.add_argument("--video_fps", type=int, default=20, help="Video FPS")
     parser.add_argument(
         "--video_first_person",
         action="store_true",
-        help="Render video from the env's first-person view (matches 07b)",
-    )
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable extra debug prints for obs/action mapping",
+        help="Render from env first-person view (fallback to default camera)",
     )
     parser.add_argument(
         "--clamp_action",
         type=float,
-        default=None,
-        help="Clamp env action to +/- this value (debug)",
+        default=0.25,
+        help="Clamp env action to +/- this value (set None to disable)",
     )
     parser.add_argument(
-        "--clip_action_limits",
+        "--no_clip_action_limits",
         action="store_true",
-        help="Clip env action per-dimension to controller limits",
+        help="Disable per-dimension clipping to controller limits",
     )
     parser.add_argument(
-        "--zero_base_motion",
+        "--assist_base_to_handle",
         action="store_true",
-        help="Zero out base motion components in policy action (debug)",
+        help="Enable base-to-handle assist (default off unless flag is set)",
     )
     parser.add_argument(
-        "--fixed_control_mode",
+        "--assist_base_gain",
         type=float,
-        default=None,
-        help="Force control_mode to a fixed value (debug)",
+        default=0.2,
+        help="Strength of base-to-handle assist",
     )
     parser.add_argument(
-        "--force_n_action_steps",
-        type=int,
-        default=None,
-        help="Override policy n_action_steps for evaluation (debug)",
+        "--assist_distance_threshold",
+        type=float,
+        default=0.15,
+        help="Distance threshold before applying base assist",
     )
+    parser.add_argument("--debug", action="store_true", help="Enable debug prints")
     args = parser.parse_args()
 
     try:
@@ -702,74 +586,43 @@ def main():
         print("ERROR: PyTorch is required. Install with: pip install torch")
         sys.exit(1)
 
-    print("=" * 60)
-    print("  OpenCabinet - Policy Evaluation")
-    print("=" * 60)
-
+    print_section("OpenCabinet - Max-Success Evaluation")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load the trained policy
     policy, shape_meta = load_unet_lowdim_policy(args.checkpoint, device)
-    mode = "unet"
 
-    # Run evaluation
-    print_section(f"Evaluating on {args.split} split ({args.num_rollouts} episodes)")
+    results = run_evaluation(
+        policy=policy,
+        shape_meta=shape_meta,
+        num_rollouts=args.num_rollouts,
+        max_steps=args.max_steps,
+        split=args.split,
+        seed=args.seed,
+        video_path=args.video_path,
+        video_width=args.video_width,
+        video_height=args.video_height,
+        video_fps=args.video_fps,
+        video_first_person=args.video_first_person,
+        clamp_action=args.clamp_action,
+        clip_action_limits=not args.no_clip_action_limits,
+        assist_base_to_handle=args.assist_base_to_handle,
+        assist_base_gain=args.assist_base_gain,
+        assist_distance_threshold=args.assist_distance_threshold,
+        debug=args.debug,
+    )
 
-    if mode == "unet":
-        results = run_evaluation_unet(
-            policy=policy,
-            shape_meta=shape_meta,
-            num_rollouts=args.num_rollouts,
-            max_steps=args.max_steps,
-            split=args.split,
-            video_path=args.video_path,
-            video_width=args.video_width,
-            video_height=args.video_height,
-            video_first_person=args.video_first_person,
-            seed=args.seed,
-            debug=args.debug,
-            clamp_action=args.clamp_action,
-            clip_action_limits=args.clip_action_limits,
-            zero_base_motion=args.zero_base_motion,
-            fixed_control_mode=args.fixed_control_mode,
-            force_n_action_steps=args.force_n_action_steps,
-        )
-
-    # Print summary
     print_section("Evaluation Results")
-
     num_success = sum(results["successes"])
     success_rate = num_success / args.num_rollouts * 100
     avg_length = np.mean(results["episode_lengths"])
     avg_reward = np.mean(results["rewards"])
-
     print(f"  Split:          {args.split}")
     print(f"  Episodes:       {args.num_rollouts}")
     print(f"  Successes:      {num_success}/{args.num_rollouts}")
     print(f"  Success rate:   {success_rate:.1f}%")
     print(f"  Avg ep length:  {avg_length:.1f} steps")
     print(f"  Avg reward:     {avg_reward:.3f}")
-
-    if args.video_path:
-        print(f"\n  Video saved to: {args.video_path}")
-
-    # Context for expected performance
-    print_section("Performance Context")
-    print(
-        "Expected success rates from the RoboCasa benchmark:\n"
-        "\n"
-        "  Method            | Pretrain | Target\n"
-        "  ------------------|----------|-------\n"
-        "  Random actions    |    ~0%   |   ~0%\n"
-        "  Diffusion Policy  |  ~30-60% | ~20-50%\n"
-        "  pi-0              |  ~40-70% | ~30-60%\n"
-        "  GR00T N1.5        |  ~35-65% | ~25-55%\n"
-        "\n"
-        "Note: The simple MLP policy from Step 6 is not expected to\n"
-        "achieve meaningful success rates. Use the official Diffusion\n"
-        "Policy repo for real results."
-    )
 
 
 if __name__ == "__main__":

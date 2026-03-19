@@ -70,11 +70,17 @@ cabinet_door_project/
   03_teleop_collect_demos.py     # Teleoperate the robot to collect your own demonstrations
   04_download_dataset.py         # Download the pre-collected OpenCabinet dataset
   05_playback_demonstrations.py  # Play back demonstrations to see expert behavior
-  06_train_policy.py             # Train a simple MLP behavior-cloning policy
-  07_evaluate_policy.py          # Evaluate your trained policy in simulation
+  05b_augment_handle_data.py     # Augment dataset with handle/door features
+  06_train_policy.py             # Train a local low-dim Diffusion U-Net policy
+  07_evaluate_policy.py          # General evaluator (BC + local low-dim checkpoints)
+  07b_evaluate_policy.py         # Diffusion Policy evaluator with correct key mapping
+  07c_evaluate_policy.py         # Low-dim evaluator with handle features + action remap
+  07c_evaluate_policy_max.py     # Max-success evaluator (extra heuristics + clipping)
   08_visualize_policy_rollout.py # Visualize a rollout of your policy in RoboCasa
   configs/
     diffusion_policy.yaml        # Training hyperparameters
+    unet_lowdim_local.yaml       # Local low-dim Diffusion U-Net hyperparameter template
+  diffusion_policy/              # RoboCasa fork of Diffusion Policy (in-repo)
   notebook.ipynb                 # Interactive Jupyter notebook companion
 install.sh                       # Installation script (macOS + WSL/Linux)
 README.md                        # This file
@@ -161,16 +167,36 @@ python 05_playback_demonstrations.py
 Visualize the downloaded demonstrations to see how an expert opens cabinet
 doors. This is the data your policy will learn from.
 
+### Step 5b: Augment Dataset with Handle Features
+
+```bash
+python 05b_augment_handle_data.py
+```
+
+Adds state-only features that make cabinet manipulation much easier:
+- `observation.handle_pos` (3): handle world position
+- `observation.handle_to_eef_pos` (3): handle relative to end-effector
+- `observation.door_openness` (1): door openness in [0, 1]
+
+These are used by the low-dim Diffusion U-Net policy in Step 6.
+
 ### Step 6: Train a Policy
 
 ```bash
 python 06_train_policy.py
 ```
 
-Trains a simple MLP behavior-cloning policy on low-dimensional state-action
-pairs from the demonstration data. This is meant to illustrate the
-data-loading → training → checkpoint pipeline, not to produce a policy that
-can reliably solve the task.
+Trains a **local low-dimensional Diffusion U-Net policy** on state-action pairs
+from the demonstration data. This is the policy we used for most of the local
+experiments in this repo.
+
+Common options:
+```bash
+python 06_train_policy.py --epochs 50 --batch_size 64
+```
+
+Hyperparameter template for local runs:
+- `cabinet_door_project/configs/unet_lowdim_local.yaml`
 
 For a policy that actually works, use one of the official training repos:
 
@@ -181,12 +207,7 @@ cd diffusion_policy && pip install -e .
 python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
 ```
 
-You can also print setup instructions for Diffusion Policy, pi-0, and GR00T
-directly from the script:
-
-```bash
-python 06_train_policy.py --use_diffusion_policy
-```
+See `cabinet_door_project/diffusion_policy/README.md` for up-to-date setup and eval commands.
 
 ### Step 7: Evaluate Your Policy
 
@@ -197,6 +218,12 @@ python 07_evaluate_policy.py --checkpoint path/to/checkpoint.pt
 Runs your trained policy in the simulation environment and reports success
 rate across multiple episodes and kitchen scenes.
 
+**Evaluation script variants**
+- `07_evaluate_policy.py`: General evaluator for local low-dim checkpoints.
+- `07b_evaluate_policy.py`: Diffusion Policy evaluator with **correct observation key mapping**.
+- `07c_evaluate_policy.py`: Low-dim evaluator with **handle feature reconstruction** and **action remapping**.
+- `07c_evaluate_policy_max.py`: Tuned for **max success** (action clipping, optional clamp, base-to-handle assist).
+
 ---
 
 ## Key Concepts
@@ -206,7 +233,7 @@ rate across multiple episodes and kitchen scenes.
 - **Goal**: Open a kitchen cabinet door
 - **Fixture**: `HingeCabinet` (a cabinet with hinged doors)
 - **Initial state**: Cabinet door is closed; robot is positioned nearby
-- **Success**: `fixture.is_open(env)` returns `True`
+- **Success**: At least one cabinet door is open (any door joint ≥ 0.90)
 - **Horizon**: 500 timesteps at 20 Hz control frequency (25 seconds)
 - **Scene variety**: 2,500+ kitchen layouts/styles for generalization
 
@@ -222,6 +249,11 @@ rate across multiple episodes and kitchen scenes.
 | `robot0_base_quat` | (4,) | Base orientation quaternion |
 | `robot0_base_to_eef_pos` | (3,) | End-effector pos relative to base |
 | `robot0_base_to_eef_quat` | (4,) | End-effector orientation relative to base |
+
+**Augmented state-only features (Step 5b):**
+- `observation.handle_pos` (3) — handle world position
+- `observation.handle_to_eef_pos` (3) — handle relative to end-effector
+- `observation.door_openness` (1) — door openness in [0, 1]
 
 ### Action Space (PandaOmron)
 
@@ -245,6 +277,26 @@ dataset/
 ```
 
 ---
+
+## Policies Used In This Project
+
+- **Local low-dim Diffusion U-Net**: Trained via `06_train_policy.py` and evaluated with `07c_evaluate_policy.py` or `07c_evaluate_policy_max.py`.
+- **Diffusion Policy (RoboCasa fork)**: In-repo at `cabinet_door_project/diffusion_policy` and based on the upstream `real-stanford/diffusion_policy` codebase.
+
+## Diffusion Policy (GitHub + Local Fork)
+
+We include the RoboCasa fork of Diffusion Policy at:
+- `cabinet_door_project/diffusion_policy`
+
+Upstream repositories:
+- `https://github.com/real-stanford/diffusion_policy`
+- `https://github.com/robocasa-benchmark/diffusion_policy`
+
+Quick reference (from the fork README):
+```bash
+python train.py --config-name=train_diffusion_unet_lowdim task=robocasa/OpenCabinet
+python eval_robocasa.py --checkpoint <checkpoint-path> --task_set <task-set> --split <split>
+```
 
 ## Architecture Diagram
 
@@ -284,21 +336,18 @@ dataset/
 
 ## Research Directions
 
-The MLP baseline in `06_train_policy.py` is intentionally simple — it
-demonstrates the pipeline but will basically always fail. Here are three
-fun directions to improve the model:
+The local low-dim Diffusion U-Net in `06_train_policy.py` is a lightweight
+baseline — useful for iteration, but not the strongest possible policy.
+Here are three fun directions to improve the model:
 
-### Minimal Diffusion Policy
+### Full Diffusion Policy (Transformer Backbone)
 
-Replace the direct-regression MLP with a diffusion-based action generator.
-The core loop is to corrupt ground-truth actions with Gaussian noise,
-train the network to predict that noise conditioned on the current state, and
-at inference iteratively denoise from pure noise to produce an action. This
-properly handles multi-modal demonstrations (e.g., approaching the handle from
-the left vs. right) that MSE loss averages into useless mean actions.
-See [Chi et al., 2023](https://diffusion-policy.cs.columbia.edu/) for the
-full approach — a minimal version can be built in ~100 lines on top of the
-existing MLP backbone.
+Scale up from the local low-dim U-Net to the full Diffusion Policy training
+stack (Transformer/Unet variants + RoboCasa evaluation). This improves
+multi-modality handling and long-horizon behavior. See
+[Chi et al., 2023](https://diffusion-policy.cs.columbia.edu/) and the
+RoboCasa fork in `cabinet_door_project/diffusion_policy` for full configs and
+evaluation scripts.
 
 ### DAgger (Online Correction)
 

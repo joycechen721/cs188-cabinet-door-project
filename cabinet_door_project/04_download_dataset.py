@@ -12,9 +12,16 @@ The dataset will be downloaded to the default RoboCasa datasets directory.
 """
 
 import os
+import ssl
+import urllib.request
 import robocasa  # noqa: F401
 from robocasa.scripts.download_datasets import download_datasets
 from robocasa.utils.dataset_registry_utils import get_ds_path
+
+# Disable SSL verification for Box downloads (safe for trusted UT Box servers)
+# This is necessary on some macOS systems with Python SSL certificate issues
+ssl._create_default_https_context = ssl._create_unverified_context
+urllib.request.ssl._create_default_https_context = ssl._create_unverified_context
 
 
 def main():
