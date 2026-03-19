@@ -15,7 +15,7 @@ import sys
 from collections import deque
 from pathlib import Path
 
-# Add diffusion_policy to path
+# Add diffusion_policy to path (supports in-repo fork or parent checkout)
 _script_dir = Path(__file__).parent.absolute()
 _cabinet_dir = _script_dir if (_script_dir / "diffusion_policy").exists() else _script_dir.parent
 _diffusion_dir = _cabinet_dir / "diffusion_policy"
@@ -40,15 +40,13 @@ from robocasa.utils.env_utils import create_env
 
 def get_mj_model_data(env):
     """
-    Robustly retrieve the MuJoCo model and data objects from a robosuite env.
-
-    Robosuite (and its wrappers) expose these through several different paths
-    depending on the version and binding (mujoco-py vs dm_control vs mujoco>=2.3):
-
-      1. env.sim.model / env.sim.data          (mujoco-py / old robosuite)
-      2. env.sim.model._model / env.sim.data   (some mixed versions)
-      3. env.model / env.data                  (newer native mujoco binding)
-      4. env.physics.model / env.physics.data  (dm_control style)
+    Retrieve MuJoCo model/data objects across robosuite variants.
+    
+    Args:
+        env: Robosuite/RoboCasa environment instance.
+    
+    Returns:
+        Tuple of (model, data) or None if not found.
     """
     # Collect candidates: the env itself plus any wrapped inner envs
     candidates = [env]
@@ -85,6 +83,15 @@ def get_mj_model_data(env):
 
 
 def print_section(title):
+    """
+    Print a formatted banner to separate major stages in logs.
+    
+    Args:
+        title: Section title to display.
+    
+    Returns:
+        None.
+    """
     print(f"\n{'=' * 60}")
     print(f"  {title}")
     print(f"{'=' * 60}")
@@ -92,9 +99,14 @@ def print_section(title):
 
 def find_fixture_handle_bodies(model, fixture_name=None):
     """
-    Find MuJoCo body names for door handles.
-    If fixture_name is given, filter to that fixture.
-    Otherwise return ALL bodies containing 'handle' in their name.
+    Find handle body names in the MuJoCo model.
+    
+    Args:
+        model: MuJoCo model.
+        fixture_name: Optional fixture name to filter.
+    
+    Returns:
+        List of handle body names.
     """
     handle_bodies = []
     for i in range(model.nbody):
@@ -108,9 +120,14 @@ def find_fixture_handle_bodies(model, fixture_name=None):
 
 def find_fixture_door_joints(model, fixture_name=None):
     """
-    Find door hinge joint names.
-    If fixture_name is given, filter to that fixture.
-    Otherwise return ALL joints containing 'door' or 'hinge' in their name.
+    Find door hinge joint names in the MuJoCo model.
+    
+    Args:
+        model: MuJoCo model.
+        fixture_name: Optional fixture name to filter.
+    
+    Returns:
+        List of (joint_name, joint_index) tuples.
     """
     joints = []
     for i in range(model.njnt):
@@ -124,28 +141,17 @@ def find_fixture_door_joints(model, fixture_name=None):
 
 
 def compute_door_openness(model, data, door_joints):
-    """Compute average normalized door openness (0=closed, 1=fully open)."""
-    if not door_joints:
-        return 0.0
-    openness_vals = []
-    for _, jidx in door_joints:
-        addr = model.joint(jidx).qposadr[0]
-        qpos = data.qpos[addr]
-        jrange = model.jnt_range[jidx]
-        jmin, jmax = jrange[0], jrange[1]
-        if jmax - jmin > 1e-8:
-            if abs(jmin) < abs(jmax):
-                norm = abs(qpos - jmin) / (jmax - jmin)
-            else:
-                norm = abs(qpos - jmax) / (jmax - jmin)
-        else:
-            norm = 0.0
-        openness_vals.append(np.clip(norm, 0.0, 1.0))
-    return float(np.mean(openness_vals))
-
-
-def build_handle_to_joint_map(handle_bodies, door_joints):
-    """Map each handle body to its associated door joint(s)."""
+    """
+    Compute normalized door openness for a set of joints.
+    
+    Args:
+        model: MuJoCo model.
+        data: MuJoCo data.
+        door_joints: List of (joint_name, joint_index) tuples.
+    
+    Returns:
+        Float in [0, 1] for average openness.
+    """
     if len(handle_bodies) == 1 or len(door_joints) == 1:
         return {hb: door_joints for hb in handle_bodies}
 
@@ -163,35 +169,17 @@ def build_handle_to_joint_map(handle_bodies, door_joints):
 
 
 def compute_handle_features(env, handle_ctx, open_threshold=0.90):
-    """Compute handle_pos, handle_to_eef_pos, and door_openness from env."""
-    model, data = get_mj_model_data(env)
-    eef_pos = data.body("gripper0_right_eef").xpos.copy()
-
-    handle_bodies = handle_ctx["handle_bodies"]
-    handle_to_joint_map = handle_ctx["handle_to_joint_map"]
-
-    per_door = {
-        hb: compute_door_openness(model, data, handle_to_joint_map[hb])
-        for hb in handle_bodies
-    }
-    active = [hb for hb in handle_bodies if per_door[hb] < open_threshold]
-    candidates = active if active else handle_bodies
-    dists = [np.linalg.norm(data.body(hb).xpos - eef_pos) for hb in candidates]
-    target_handle = candidates[int(np.argmin(dists))]
-
-    handle_pos = data.body(target_handle).xpos.copy()
-    handle_to_eef = handle_pos - eef_pos
-    openness = per_door[target_handle]
-
-    return {
-        "handle_pos": handle_pos.astype(np.float32),
-        "handle_to_eef_pos": handle_to_eef.astype(np.float32),
-        "door_openness": np.array([openness], dtype=np.float32),
-    }
-
-
-def check_any_door_open(env, threshold=0.90, handle_ctx=None):
-    """Return True if any door joint is open past threshold."""
+    """
+    Compute handle-related low-dim features for evaluation.
+    
+    Args:
+        env: RoboCasa environment instance.
+        handle_ctx: Dict with handle bodies and joint map.
+        open_threshold: Door openness threshold.
+    
+    Returns:
+        Dict with handle_pos, handle_to_eef_pos, door_openness.
+    """
     # Use pre-found joints from handle_ctx when available (more reliable)
     if handle_ctx is not None:
         model, data = get_mj_model_data(env)
@@ -217,33 +205,15 @@ def check_any_door_open(env, threshold=0.90, handle_ctx=None):
 
 
 def load_checkpoint_and_config(checkpoint_path):
-    """Load checkpoint and config (if available)."""
-    checkpoint_path = Path(checkpoint_path).absolute()
-
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    print(f"Loaded checkpoint: {checkpoint_path}")
-
-    run_dir = checkpoint_path.parent.parent
-    config_path = run_dir / ".hydra" / "config.yaml"
-
-    if not config_path.exists():
-        config_path = run_dir / "config.yaml"
-
-    if not config_path.exists():
-        print("Config not found next to checkpoint. Falling back to checkpoint metadata.")
-        return checkpoint, None
-
-    cfg = OmegaConf.load(config_path)
-    print(f"Loaded config: {config_path}")
-
-    return checkpoint, cfg
-
-
-def load_normalizer(normalizer_path):
-    """Load normalizer."""
+    """
+    Load a checkpoint and its Hydra config if present.
+    
+    Args:
+        checkpoint_path: Path to a .ckpt file.
+    
+    Returns:
+        Tuple of (checkpoint_dict, cfg_or_None).
+    """
     normalizer_path = Path(normalizer_path).absolute()
 
     if not normalizer_path.exists():
@@ -257,20 +227,21 @@ def load_normalizer(normalizer_path):
 
 
 def build_normalizer_from_cfg(cfg):
-    """Recompute normalizer from dataset config."""
-    OmegaConf.register_new_resolver("eval", eval, replace=True)
-    dataset = hydra.utils.instantiate(cfg.task.dataset)
-    normalizer = dataset.get_normalizer()
-    return normalizer
-
-
-def create_policy_from_local_checkpoint(checkpoint, normalizer, device):
-    """Create policy from a local 06_train_policy.py checkpoint."""
+    """
+    Recreate a normalizer by instantiating the dataset from config.
+    
+    Args:
+        cfg: Hydra config with task.dataset.
+    
+    Returns:
+        Normalizer object.
+    """
     from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
     from diffusion_policy.policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy
     from diffusion_policy.model.common.normalizer import LinearNormalizer
     from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
+    # Pull model hyperparams saved in the local checkpoint
     cfg = checkpoint.get("config", {})
     model_cfg = checkpoint.get("model_config", {})
     horizon = int(cfg.get("horizon", 16))
@@ -288,6 +259,7 @@ def create_policy_from_local_checkpoint(checkpoint, normalizer, device):
     obs_as_global_cond = bool(model_cfg.get("obs_as_global_cond", True))
     pred_action_steps_only = bool(model_cfg.get("pred_action_steps_only", False))
 
+    # Rebuild the model architecture to match training
     model = ConditionalUnet1D(
         input_dim=action_dim,
         global_cond_dim=obs_dim * n_obs_steps,
@@ -296,12 +268,14 @@ def create_policy_from_local_checkpoint(checkpoint, normalizer, device):
         kernel_size=kernel_size,
         n_groups=n_groups,
     )
+    # Scheduler must match training config for correct inference behavior
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=num_train_timesteps,
         beta_schedule="squaredcos_cap_v2",
         clip_sample=True,
         prediction_type="epsilon",
     )
+    # Policy wrapper exposes predict_action and compute_loss
     policy = DiffusionUnetLowdimPolicy(
         model=model,
         noise_scheduler=noise_scheduler,
@@ -327,64 +301,17 @@ def create_policy_from_local_checkpoint(checkpoint, normalizer, device):
 
 
 def create_policy_from_checkpoint(checkpoint, cfg, normalizer, device):
-    """Create and load policy."""
-    OmegaConf.register_new_resolver("eval", eval, replace=True)
-    policy = hydra.utils.instantiate(cfg.policy)
-    policy = policy.to(device)
-
-    print(f"\nPolicy Details:")
-    print(f"  Type: {type(policy).__name__}")
-    print(f"  Model parameters: {sum(p.numel() for p in policy.model.parameters()):,}")
-    obs_feature_dim = getattr(policy, "obs_feature_dim", None)
-    if obs_feature_dim is None:
-        obs_feature_dim = getattr(policy, "obs_dim", None)
-    if obs_feature_dim is not None:
-        print(f"  obs_feature_dim: {obs_feature_dim}")
-    print(f"  action_dim: {policy.action_dim}")
-    print(f"  horizon: {policy.horizon}")
-
-    policy.set_normalizer(normalizer)
-    print(f"  ✓ Normalizer loaded")
-
-    state_dicts = checkpoint.get("state_dicts", {})
-    if "ema_model" in state_dicts:
-        state_dict = state_dicts["ema_model"]
-        print("  → Using EMA model weights")
-    elif "model" in state_dicts:
-        state_dict = state_dicts["model"]
-        print("  → Using model weights")
-    else:
-        raise ValueError("No model weights found in checkpoint")
-
-    policy.load_state_dict(state_dict, strict=False)
-    print("  ✓ Loaded model state successfully")
-
-    policy.eval()
-    return policy
-
-
-# ---------------------------------------------------------------------------
-# Key mapping
-# ---------------------------------------------------------------------------
-
-KEY_MAPPING = {
-    "base_pos": "robot0_base_pos",
-    "base_quat": "robot0_base_quat",
-    "robot0_base_to_eef_pos": "robot0_base_to_eef_pos",
-    "robot0_base_to_eef_quat": "robot0_base_to_eef_quat",
-    "robot0_gripper_qpos": "robot0_gripper_qpos",
-    "handle_pos": "handle_pos",
-    "handle_to_eef_pos": "handle_to_eef_pos",
-    "door_openness": "door_openness",
-}
-
-
-def extract_single_obs_vec(obs_raw, training_keys, obs_meta=None, debug=False):
     """
-    Extract a single flat observation vector from the environment obs dict.
-
-    Returns a 1-D float32 array of shape (obs_dim,), or None on failure.
-    The ordering matches the concatenation order used during training.
+    Instantiate and load a policy from a Diffusion Policy checkpoint.
+    
+    Args:
+        checkpoint: Dict loaded from torch.
+        cfg: Hydra config with policy definition.
+        normalizer: Normalizer instance.
+        device: Torch device.
+    
+    Returns:
+        Loaded policy model.
     """
     parts = []
     missing = []
@@ -488,6 +415,16 @@ def run_evaluation(
         print(f"Saving videos to: {video_dir}")
 
         def render_frame():
+            """
+            Render a frame from the environment for video logging.
+            
+            Args:
+                None.
+            
+            Returns:
+                RGB array frame or None if rendering fails.
+            """
+            # Agentview camera by default (consistent across scripts)
             try:
                 return env.sim.render(
                     height=video_height,
@@ -552,6 +489,16 @@ def run_evaluation(
         obs_buffer = deque(maxlen=n_obs_steps)
 
         def obs_to_vec(raw_obs):
+            """
+            Convert a raw observation dict into a flat vector for the policy.
+            
+            Args:
+                raw_obs: Raw observation dict from the env.
+            
+            Returns:
+                1-D float32 numpy array or None on failure.
+            """
+            # Augment obs with handle features when required
             aug = raw_obs
             if handle_ctx is not None:
                 try:
@@ -590,7 +537,7 @@ def run_evaluation(
             obs_seq = np.stack(list(obs_buffer), axis=0)          # (n_obs_steps, obs_dim)
             obs_tensor = torch.from_numpy(obs_seq).unsqueeze(0).to(device)  # (1, T, D)
 
-            # Predict action chunk
+            # Predict action chunk (receding-horizon)
             try:
                 with torch.no_grad():
                     if type(policy).__name__ == "DiffusionUnetLowdimPolicy":
@@ -613,7 +560,7 @@ def run_evaluation(
                 break
 
             # ------------------------------------------------------------------
-            # FIX 2: Execute the full predicted action chunk (receding horizon)
+            # Execute the full predicted action chunk (receding horizon)
             # Re-query the policy only after consuming all n_action_steps actions.
             # ------------------------------------------------------------------
             chunk_len = min(n_action_steps, len(actions), max_steps - global_step)
@@ -621,6 +568,7 @@ def run_evaluation(
                 action_np = actions[i]
 
                 if fix_action_semantics and action_np.shape[-1] >= 12:
+                    # Optional heuristic: zero base motion, force control mode
                     # Action layout: eef_pos(3), eef_rot(3), gripper(1), base_motion(4), control_mode(1)
                     action_np = action_np.copy()
                     action_np[7:11] = 0.0  # zero base motion
@@ -630,6 +578,7 @@ def run_evaluation(
                         printed_action_fix = True
 
                 if assist_base_to_handle and handle_ctx is not None and action_np.shape[-1] >= 12:
+                    # Optional heuristic: nudge base toward handle in XY
                     try:
                         extra = compute_handle_features(env, handle_ctx)
                         to_eef = extra["handle_to_eef_pos"]
@@ -700,6 +649,9 @@ def run_evaluation(
 
 
 def main():
+    """
+    Parse CLI args and launch evaluation/training.
+    """
     parser = argparse.ArgumentParser(
         description="Evaluate a trained Diffusion Policy on OpenCabinet (Proper Key Mapping)"
     )

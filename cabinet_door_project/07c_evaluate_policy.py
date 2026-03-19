@@ -26,39 +26,30 @@ from robocasa.utils.env_utils import create_env
 
 
 def print_section(title):
+    """
+    Print a formatted banner to separate major stages in logs.
+    
+    Args:
+        title: Section title to display.
+    
+    Returns:
+        None.
+    """
     print(f"\n{'=' * 60}")
     print(f"  {title}")
     print(f"{'=' * 60}")
 
 
 def get_mj_model_data(env):
-    """Robustly retrieve MuJoCo model/data across robosuite versions."""
-    candidates = [env]
-    for attr in ("env", "_env", "unwrapped"):
-        if hasattr(env, attr):
-            candidates.append(getattr(env, attr))
-
-    for obj in candidates:
-        if hasattr(obj, "sim") and obj.sim is not None:
-            sim = obj.sim
-            if hasattr(sim, "model") and hasattr(sim, "data"):
-                return sim.model, sim.data
-            if hasattr(sim, "_model") and hasattr(sim, "_data"):
-                return sim._model, sim._data
-
-        if hasattr(obj, "model") and hasattr(obj, "data"):
-            m, d = obj.model, obj.data
-            if hasattr(m, "nbody") and hasattr(d, "qpos"):
-                return m, d
-
-        if hasattr(obj, "physics"):
-            ph = obj.physics
-            if hasattr(ph, "model") and hasattr(ph, "data"):
-                return ph.model, ph.data
-
-
-def find_fixture_handle_bodies(model, fixture_name=None):
-    """Find MuJoCo body names for door handles."""
+    """
+    Retrieve MuJoCo model/data objects across robosuite variants.
+    
+    Args:
+        env: Robosuite/RoboCasa environment instance.
+    
+    Returns:
+        Tuple of (model, data) or None if not found.
+    """
     handle_bodies = []
     for i in range(model.nbody):
         name = model.body(i).name
@@ -70,20 +61,16 @@ def find_fixture_handle_bodies(model, fixture_name=None):
 
 
 def find_fixture_door_joints(model, fixture_name=None):
-    """Find door hinge joint names."""
-    joints = []
-    for i in range(model.njnt):
-        jname = model.joint(i).name
-        is_door = "door" in jname or "hinge" in jname
-        if not is_door:
-            continue
-        if fixture_name is None or fixture_name in jname:
-            joints.append((jname, i))
-    return joints
-
-
-def compute_door_openness(model, data, door_joints):
-    """Compute average normalized door openness (0=closed, 1=fully open)."""
+    """
+    Find door hinge joint names in the MuJoCo model.
+    
+    Args:
+        model: MuJoCo model.
+        fixture_name: Optional fixture name to filter.
+    
+    Returns:
+        List of (joint_name, joint_index) tuples.
+    """
     if not door_joints:
         return 0.0
     openness_vals = []
@@ -104,25 +91,16 @@ def compute_door_openness(model, data, door_joints):
 
 
 def build_handle_to_joint_map(handle_bodies, door_joints):
-    """Map each handle body to its associated door joint(s)."""
-    if len(handle_bodies) == 1 or len(door_joints) == 1:
-        return {hb: door_joints for hb in handle_bodies}
-
-    result = {}
-    for hb in handle_bodies:
-        hb_lower = hb.lower()
-        if "left" in hb_lower:
-            matched = [(jn, ji) for jn, ji in door_joints if "left" in jn.lower()]
-        elif "right" in hb_lower:
-            matched = [(jn, ji) for jn, ji in door_joints if "right" in jn.lower()]
-        else:
-            matched = []
-        result[hb] = matched if matched else door_joints
-    return result
-
-
-def compute_handle_features(env, handle_ctx, open_threshold=0.90):
-    """Compute handle_pos, handle_to_eef_pos, and door_openness from env."""
+    """
+    Map handle bodies to their associated door joints.
+    
+    Args:
+        handle_bodies: List of handle body names.
+        door_joints: List of (joint_name, joint_index) tuples.
+    
+    Returns:
+        Dict mapping handle body name -> list of door joints.
+    """
     model, data = get_mj_model_data(env)
     eef_pos = data.body("gripper0_right_eef").xpos.copy()
 
@@ -150,43 +128,17 @@ def compute_handle_features(env, handle_ctx, open_threshold=0.90):
 
 
 def check_any_door_open(env, threshold=0.90, handle_ctx=None):
-    """Return True if any door joint is open past threshold."""
-    if handle_ctx is not None:
-        model, data = get_mj_model_data(env)
-        for joints in handle_ctx["handle_to_joint_map"].values():
-            if compute_door_openness(model, data, joints) >= threshold:
-                return True
-        return False
-
-    fxtr = getattr(env, "fxtr", None)
-    if fxtr is None or not hasattr(fxtr, "get_joint_state"):
-        return env._check_success()
-
-    joint_names = getattr(fxtr, "door_joint_names", None)
-    if not joint_names:
-        return env._check_success()
-
-    try:
-        joint_state = fxtr.get_joint_state(env, joint_names)
-    except Exception:
-        return env._check_success()
-
-    return any(val >= threshold for val in joint_state.values())
-
-
-KEY_MAPPING = {
-    "base_pos": "robot0_base_pos",
-    "base_quat": "robot0_base_quat",
-    "robot0_base_to_eef_pos": "robot0_base_to_eef_pos",
-    "robot0_base_to_eef_quat": "robot0_base_to_eef_quat",
-    "robot0_gripper_qpos": "robot0_gripper_qpos",
-    "handle_pos": "door_obj_pos",
-    "handle_to_eef_pos": "door_obj_to_robot0_eef_pos",
-    "door_openness": "door_openness",
-}
-
-
-def extract_single_obs_vec(obs_raw, training_keys, obs_meta=None, debug=False):
+    """
+    Check whether any cabinet door is open past a threshold.
+    
+    Args:
+        env: RoboCasa environment instance.
+        threshold: Openness threshold.
+        handle_ctx: Optional handle context for joint lookup.
+    
+    Returns:
+        True if any door is open beyond threshold.
+    """
     parts = []
     missing = []
     for key in training_keys:
@@ -220,18 +172,13 @@ def extract_single_obs_vec(obs_raw, training_keys, obs_meta=None, debug=False):
 
 def remap_action(raw):
     """
-    Training action layout:
-      raw[0:4]   base_motion (x, y, yaw, torso)
-      raw[4]     control_mode
-      raw[5:11]  eef_pos + eef_rot
-      raw[11]    gripper
-
-    Env layout:
-      env[0:6]   arm (eef_pos + eef_rot)
-      env[6]     gripper
-      env[7:10]  base (x, y, yaw)
-      env[10]    torso
-      env[11]    control_mode
+    Reorder a policy action into the env's expected 12D action layout.
+    
+    Args:
+        raw: 1-D policy action vector.
+    
+    Returns:
+        1-D float32 numpy array in env action order.
     """
     action_env = np.zeros(12, dtype=np.float32)
     action_env[0:6] = raw[5:11]
@@ -528,6 +475,9 @@ def run_evaluation(
 
 
 def main():
+    """
+    Parse CLI args and launch evaluation/training.
+    """
     parser = argparse.ArgumentParser(description="Max-success evaluation for OpenCabinet")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pt checkpoint")
     parser.add_argument("--num_rollouts", type=int, default=20, help="Number of evaluation episodes")

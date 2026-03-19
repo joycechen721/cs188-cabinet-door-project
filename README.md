@@ -292,6 +292,11 @@ Upstream repositories:
 - `https://github.com/real-stanford/diffusion_policy`
 - `https://github.com/robocasa-benchmark/diffusion_policy`
 
+Compatible fork with local edits used for our trained policy:
+```
+https://github.com/joycechen721/diffusion_policy
+```
+
 Quick reference (from the fork README):
 ```bash
 python train.py --config-name=train_diffusion_unet_lowdim task=robocasa/OpenCabinet
