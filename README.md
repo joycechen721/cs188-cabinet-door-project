@@ -2,9 +2,9 @@
 
 ### Introduction
 
-The project aims toward implementing a diffusion policy to handle the OpenCabient task in RoboCasa. Given the template starter project for CS188, we modify the the overall diffusion policy from the [suggested implemention]([url](https://github.com/robocasa-benchmark/diffusion_policy)) to achieve the following goals: (1) to train and evaluate diffusion policy architectures from the official Diffusion Policy repository on a pre-collected OpenCabinet demonstration dataset; (2) to investigate whether augmenting the robot’s proprioceptive state with explicit task-relevant features improves policy performance; (3) to examine sources of failure in the evaluation pipeline and develop principled corrections; and (4) to characterize the trade-offs between model capacity, training efficiency, and task success rate under realistic compute constraints.
+The project aims toward implementing a diffusion policy to handle the OpenCabient task in RoboCasa. Given the template starter project for CS188, we modify the the overall diffusion policy from the ([suggested implemention](https://github.com/robocasa-benchmark/diffusion_policy)) to achieve the following goals: (1) to train and evaluate diffusion policy architectures from the official Diffusion Policy repository on a pre-collected OpenCabinet demonstration dataset; (2) to investigate whether augmenting the robot’s proprioceptive state with explicit task-relevant features improves policy performance; (3) to examine sources of failure in the evaluation pipeline and develop principled corrections; and (4) to characterize the trade-offs between model capacity, training efficiency, and task success rate under realistic compute constraints.
 
-With this basic starter code, we call our [modified diffusion policy]([url](https://github.com/joycechen721/diffusion_policy)) for training the model given a set of demonstrations and added our own scripts to evaluate the training checkpoints.
+With this basic starter code, we call our ([modified diffusion policy](https://github.com/joycechen721/diffusion_policy)) for training the model given a set of demonstrations and added our own scripts to evaluate the training checkpoints.
 
 ## Overview
 
@@ -338,48 +338,6 @@ python eval_robocasa.py --checkpoint <checkpoint-path> --task_set <task-set> --s
   |  - Contact dynamics, rendering, sensors        |
   +------------------------------------------------+
 ```
-
----
-
-## Research Directions
-
-The local low-dim Diffusion U-Net in `06_train_policy.py` is a lightweight
-baseline — useful for iteration, but not the strongest possible policy.
-Here are three fun directions to improve the model:
-
-### Full Diffusion Policy (Transformer Backbone)
-
-Scale up from the local low-dim U-Net to the full Diffusion Policy training
-stack (Transformer/Unet variants + RoboCasa evaluation). This improves
-multi-modality handling and long-horizon behavior. See
-[Chi et al., 2023](https://diffusion-policy.cs.columbia.edu/) and the
-RoboCasa fork in `cabinet_door_project/diffusion_policy` for full configs and
-evaluation scripts.
-
-### DAgger (Online Correction)
-
-Script 03 already provides keyboard teleoperation. I have it set up with a DAgger mode that may or may not be kinda buggy. Use it to close the loop:
-train a policy, roll it out, then have a human take over and correct the robot
-whenever it fails. Aggregate these corrections into the training set and
-retrain. This directly attacks distribution shift — the fundamental reason
-offline BC degrades at test time — by collecting data in the states the policy
-actually visits. Even one or two rounds of DAgger can dramatically improve
-robustness. See [Ross et al., 2011](https://arxiv.org/abs/1011.0686).
-
-### Action Chunking
-
-Instead of predicting one action per timestep, predict the next *K* actions at
-once and execute them open-loop before re-planning. This is the key idea behind
-ACT ([Zhao et al., 2023](https://arxiv.org/abs/2304.13705)) and directly fixes
-the jerky, temporally incoherent behavior of single-step BC. Fair warning, though, this will probably require a more sophisticated model (Transformer, Diffusion or other) to provide real benefits. Implementation is
-straightforward: widen the output head to `K * action_dim`, train with the same
-MSE loss over the full chunk, and add a small FIFO buffer at inference. Try
-sweeping K = 4, 8, 16 and compare smoothness and success rate.
-
-### Other Ideas
-- Gaussian Mixture Model for output logits. Can ameliorate the MSE multimodality issue.
-- Vision Transformer. Will need a beefier computer to see benefits but definitely can improve policy at scale.
-- Hooking in an existing VLM and experimenting with zero-shot inference.
 
 ---
 
