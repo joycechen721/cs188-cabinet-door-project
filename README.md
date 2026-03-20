@@ -2,9 +2,9 @@
 
 ### Introduction
 
-The project aims toward implementing a diffusion policy to handle the OpenCabient task in RoboCasa. Given the template starter project for CS188, we modify the the overall diffusion policy from the ([suggested implemention](https://github.com/robocasa-benchmark/diffusion_policy)) to achieve the following goals: (1) to train and evaluate diffusion policy architectures from the official Diffusion Policy repository on a pre-collected OpenCabinet demonstration dataset; (2) to investigate whether augmenting the robot’s proprioceptive state with explicit task-relevant features improves policy performance; (3) to examine sources of failure in the evaluation pipeline and develop principled corrections; and (4) to characterize the trade-offs between model capacity, training efficiency, and task success rate under realistic compute constraints.
+The project aims toward implementing a diffusion policy to handle the OpenCabient task in RoboCasa. Given the template starter project for CS188, we modify the the overall diffusion policy from the [suggested implemention](https://github.com/robocasa-benchmark/diffusion_policy) to achieve the following goals: (1) to train and evaluate diffusion policy architectures from the official Diffusion Policy repository on a pre-collected OpenCabinet demonstration dataset; (2) to investigate whether augmenting the robot’s proprioceptive state with explicit task-relevant features improves policy performance; (3) to examine sources of failure in the evaluation pipeline and develop principled corrections; and (4) to characterize the trade-offs between model capacity, training efficiency, and task success rate under realistic compute constraints.
 
-With this basic starter code, we call our ([modified diffusion policy](https://github.com/joycechen721/diffusion_policy)) for training the model given a set of demonstrations and added our own scripts to evaluate the training checkpoints.
+With this basic starter code, we call our [modified diffusion policy](https://github.com/joycechen721/diffusion_policy) for training the model given a set of demonstrations and added our own scripts to evaluate the training checkpoints.
 
 ## Overview
 
